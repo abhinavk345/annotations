@@ -1,0 +1,88 @@
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Lock {
+    String apiName();
+    String key();
+}
+
+===============
+package com.dpw.trips.aspect;
+
+import static com.dpw.trips.constant.TripsPropertyConstant.PROP_LOCKING_ENABLED;
+import static com.dpw.trips.constant.TripsPropertyConstant.PROP_ACQUIRE_TIMEOUT;
+
+import com.dpw.tmsutils.exception.TMSException;
+import com.dpw.trips.aspect.annotation.Lock;
+import com.dpw.trips.request.CreateChallanRequestSo;
+import com.dpw.trips.util.TMSExceptionErrorCode;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import com.dpw.trips.cache.PropertyCache;
+import com.dpw.trips.cache.CacheManager;
+
+import java.util.concurrent.TimeUnit;
+
+@Aspect
+@Component
+public class LockAspect {
+
+    private static final Logger logger = LoggerFactory.getLogger(LockAspect.class);
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Around("@annotation(lock)")
+    public Object around(ProceedingJoinPoint joinPoint, Lock lock) throws Throwable {
+
+        PropertyCache propertyCache = CacheManager.getInstance().getCache(PropertyCache.class);
+        if (!propertyCache.getBooleanProperty(PROP_LOCKING_ENABLED, Boolean.FALSE)) {
+            logger.info("Locking is disabled. Proceeding without lock.");
+            return joinPoint.proceed();
+        }
+        String apiName = lock.apiName();
+        String key = extractKeyFromArguments(joinPoint);
+        if (key == null) {
+            logger.error("Key value cannot be null : {}", apiName);
+            throw new TMSException(TMSExceptionErrorCode.DATA_NOT_FOUND.name(),"Key value cannot be null");
+        }
+        String redisKey = apiName + ":" + key;
+        boolean acquiredLock = acquireLock(redisKey);
+        if (Boolean.TRUE.equals(acquiredLock)) {
+            logger.info("Lock acquired for key: {}", redisKey);
+            try {
+                return joinPoint.proceed();
+            } finally {
+                redisTemplate.delete(redisKey);
+                logger.info("Lock released for key: {}", redisKey);
+            }
+        }else {
+            String message = apiName+" already in progress for this key: " + redisKey;
+            logger.warn("Lock already acquired for key: {}", redisKey);
+            throw new TMSException(TMSExceptionErrorCode.INVALID_REQUEST.name(),message);
+        }
+    }
+
+    private String extractKeyFromArguments(ProceedingJoinPoint joinPoint) {
+        for (Object arg : joinPoint.getArgs()) {
+            if (arg != null ) {
+               CreateChallanRequestSo createChallanRequestSo=(CreateChallanRequestSo)arg;
+               return createChallanRequestSo.getTripCode();
+            }
+        }
+        return null;
+    }
+
+    public boolean acquireLock(String redisKey) {
+        PropertyCache propertyCache = CacheManager.getInstance().getCache(PropertyCache.class);
+        long ttlInSeconds = TimeUnit.MINUTES.toSeconds(propertyCache.getLongProperty(PROP_ACQUIRE_TIMEOUT,5));
+        Boolean acquiredLock = redisTemplate.opsForValue().setIfAbsent(redisKey, "locked", ttlInSeconds, TimeUnit.SECONDS);
+        return Boolean.TRUE.equals(acquiredLock);
+    }
+
+}
